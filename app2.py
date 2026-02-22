@@ -6,13 +6,23 @@ import subprocess
 import time
 import requests
 from typing import Dict
-from langchain_core.prompts import PromptTemplate
-from langchain_community.llms import Ollama
-import pymysql
-import pymongo
-from pymongo import MongoClient
-import mysql.connector
-from mysql.connector import Error
+
+# No langchain required: we call Ollama HTTP API directly
+
+try:
+    import pymysql
+    import pymongo
+    from pymongo import MongoClient
+    import mysql.connector
+    from mysql.connector import Error
+    _db_available = True
+except ImportError:
+    _db_available = False
+    pymysql = None
+    pymongo = None
+    MongoClient = None
+    mysql = None
+    Error = None
 
 # ==============================================
 # OLLAMA SERVER MANAGEMENT
@@ -71,34 +81,48 @@ def ensure_ollama_running():
 
     return check_server_ready()
 
-def show_installation_instructions():
-    st.error("""
-    ## Ollama Setup Required
-    
-    1. **Install Ollama**:
-       - Windows: Download from [ollama.com](https://ollama.com)
-       - Mac/Linux: Run `curl -fsSL https://ollama.com/install.sh | sh`
-    
-    2. **Start Ollama** in a separate terminal:
+def ollama_ready():
+    """True if Ollama is installed and the server is reachable."""
+    if not is_ollama_installed():
+        return False
+    try:
+        r = requests.get("http://localhost:11434/api/tags", timeout=3)
+        return r.status_code == 200
+    except requests.exceptions.RequestException:
+        return False
+
+def show_installation_instructions(block_app=False):
+    """Show Ollama setup steps. If block_app=True, call st.stop()."""
+    st.error("**Ollama is not running.** Schema generation needs Ollama. Follow the steps below:")
+    with st.expander("Ollama setup (click to expand)", expanded=True):
+        st.markdown("""
+    1. **Install Ollama**
+       - **Windows:** [**Download OllamaSetup.exe**](https://ollama.com/download/OllamaSetup.exe) — run the installer
+       - **Mac/Linux:** Run `curl -fsSL https://ollama.com/install.sh | sh`
+
+    2. **Start Ollama** in a separate terminal (keep it open):
        ```bash
        ollama serve
        ```
-       (Keep this terminal open)
-    
-    3. **Download the model**:
+
+    3. **Download a model** (e.g. mistral):
        ```bash
        ollama pull mistral
        ```
-    
-    4. **Refresh this page** after setup
+
+    4. **Refresh this page** or click *Generate Schema* again.
     """)
-    st.stop()
+    if block_app:
+        st.stop()
 
 # ==============================================
 # DATABASE CONNECTION FUNCTIONS
 # ==============================================
 
 def get_mysql_connection():
+    if not _db_available:
+        st.error("DB drivers not installed. pip install pymysql mysql-connector-python pymongo")
+        return None
     try:
         connection = mysql.connector.connect(
             host=st.session_state.mysql_host,
@@ -112,6 +136,9 @@ def get_mysql_connection():
         return None
 
 def get_mongo_connection():
+    if not _db_available:
+        st.error("DB drivers not installed. pip install pymysql mysql-connector-python pymongo")
+        return None
     try:
         if st.session_state.mongo_username and st.session_state.mongo_password:
             connection_string = f"mongodb://{st.session_state.mongo_username}:{st.session_state.mongo_password}@{st.session_state.mongo_host}/{st.session_state.mongo_database}"
@@ -179,9 +206,7 @@ def create_mongo_collections(schema):
 # SCHEMA GENERATION FUNCTIONS
 # ==============================================
 
-schema_prompt = PromptTemplate(
-    input_variables=["description", "schema_type"],
-    template="""
+SCHEMA_PROMPT_TEMPLATE = """
 You are a database design expert. Generate a detailed database schema in JSON format ONLY based on:
 - Application description: {description}
 - Schema type: {schema_type}
@@ -225,7 +250,72 @@ IMPORTANT RULES:
 
 BEGIN OUTPUT:
 """
-)
+
+def call_ollama(prompt: str, model: str = "mistral", timeout: int = 120) -> str:
+    """Call Ollama HTTP API. Tries multiple endpoints for different Ollama versions."""
+    base = "http://localhost:11434"
+    messages = [{"role": "user", "content": prompt}]
+    last_error = None
+
+    # 1) /api/generate (native)
+    try:
+        r = requests.post(
+            f"{base}/api/generate",
+            json={"model": model, "prompt": prompt, "stream": False},
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        out = r.json()
+        if isinstance(out.get("response"), str):
+            return out["response"]
+    except requests.RequestException as e:
+        last_error = e
+        if getattr(e, "response", None) and getattr(e.response, "status_code", None) == 404:
+            pass
+        else:
+            raise
+
+    # 2) /v1/chat/completions (OpenAI-compatible; used by some Windows builds)
+    try:
+        r = requests.post(
+            f"{base}/v1/chat/completions",
+            json={"model": model, "messages": messages, "stream": False},
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        out = r.json()
+        choice = (out.get("choices") or [None])[0]
+        if choice and isinstance(choice.get("message"), dict):
+            content = choice["message"].get("content")
+            if isinstance(content, str):
+                return content
+    except requests.RequestException as e:
+        last_error = e
+        if getattr(e, "response", None) and getattr(e.response, "status_code", None) == 404:
+            pass
+        else:
+            raise
+
+    # 3) /api/chat (native chat)
+    try:
+        r = requests.post(
+            f"{base}/api/chat",
+            json={"model": model, "messages": messages, "stream": False},
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        out = r.json()
+        msg = out.get("message") or {}
+        if isinstance(msg.get("content"), str):
+            return msg["content"]
+    except requests.RequestException as e:
+        last_error = e
+
+    # All endpoints failed (often 404 = model not pulled)
+    hint = " Run in a terminal: ollama pull " + model
+    if last_error and getattr(last_error, "response", None) and getattr(last_error.response, "status_code", None) == 404:
+        raise RuntimeError("Ollama returned 404 (endpoint or model not found)." + hint) from last_error
+    raise RuntimeError("Ollama request failed." + hint) from last_error
 
 def extract_json_from_response(response: str) -> Dict:
     cleaned = response.strip()
@@ -256,16 +346,13 @@ def extract_json_from_response(response: str) -> Dict:
 
     return {"error": "Failed to extract valid JSON from response", "raw_response": cleaned[:500] + "..."}
 
-def generate_schema(description: str, schema_type: str) -> Dict:
+def generate_schema(description: str, schema_type: str, model: str = "mistral") -> Dict:
     try:
-        chain = schema_prompt | llm
-        response = chain.invoke({
-            "description": description,
-            "schema_type": schema_type
-        })
+        prompt = SCHEMA_PROMPT_TEMPLATE.format(description=description, schema_type=schema_type)
+        response = call_ollama(prompt, model=model, timeout=120)
         result = extract_json_from_response(response)
         if "error" in result:
-            result["raw_response"] = response[:1000]
+            result["raw_response"] = (response or "")[:1000]
         return result
     except Exception as e:
         return {"error": f"Schema generation failed: {str(e)}", "raw_response": str(e)}
@@ -384,21 +471,39 @@ def show_database_connection_form():
 def main():
     st.title("AI-Powered Database Schema Designer")
 
-    if not is_ollama_installed():
-        show_installation_instructions()
-    if not ensure_ollama_running():
-        show_installation_instructions()
+    # Show Ollama status in sidebar (don't block the app)
+    if ollama_ready():
+        st.sidebar.success("Ollama is running")
+        ensure_ollama_running()  # already running, just show message
+    else:
+        st.sidebar.warning("Ollama not detected")
+        st.sidebar.markdown("[**Download Ollama for Windows**](https://ollama.com/download/OllamaSetup.exe)")
+        if is_ollama_installed():
+            if st.sidebar.button("Start Ollama server"):
+                st.sidebar.info("Starting Ollama...")
+                if start_ollama_server():
+                    if check_server_ready(timeout=15):
+                        st.sidebar.success("Ollama started. Refreshing...")
+                        st.rerun()
+                    else:
+                        st.sidebar.error("Ollama didn't respond in time. Run `ollama serve` in a terminal.")
+                else:
+                    st.sidebar.error("Could not start Ollama. Run `ollama serve` in a terminal.")
+        with st.sidebar.expander("How to set up Ollama"):
+            st.markdown("""
+1. **Download:** [OllamaSetup.exe (Windows)](https://ollama.com/download/OllamaSetup.exe) — run the installer  
+2. In a terminal: `ollama serve`  
+3. Then: `ollama pull mistral`  
+4. Refresh this page or click **Start Ollama server** above
+            """)
 
-    global llm
-    llm = Ollama(
-        model="mistral",
-        temperature=0.3,
-        num_ctx=2000,
-        timeout=120
-    )
+    ollama_model = st.sidebar.text_input("Ollama model", value="mistral", help="Model name (e.g. mistral, llama2)")
 
-    # Database connection form
-    show_database_connection_form()
+    # Database connection form (only if DB drivers installed)
+    if _db_available:
+        show_database_connection_form()
+    else:
+        st.info("Database deploy disabled. Install: pip install pymysql mysql-connector-python pymongo")
 
     description = st.text_area(
         "Describe your application",
@@ -408,9 +513,11 @@ def main():
     schema_type = st.selectbox("Select Schema Type", ["Relational", "NoSQL"])
 
     if st.button("Generate Schema"):
-        if description:
+        if not description:
+            st.error("Please provide an application description")
+        else:
             with st.spinner("Generating schema..."):
-                schema = generate_schema(description, schema_type.lower())
+                schema = generate_schema(description, schema_type.lower(), model=ollama_model)
 
                 if schema.get('error'):
                     st.error(f"{schema['error']}\n\nRaw response preview:\n{schema.get('raw_response', 'None')}")
@@ -445,11 +552,9 @@ def main():
                     satisfaction = st.slider("Rate your satisfaction (0-100%)", 0, 100, 50)
                     if st.button("Submit Feedback"):
                         st.success(f"Thank you for your feedback! ({satisfaction}%)")
-        else:
-            st.error("Please provide an application description")
 
     # Deploy to database section
-    if 'generated_schema' in st.session_state:
+    if 'generated_schema' in st.session_state and _db_available:
         schema = st.session_state.generated_schema
         st.divider()
         st.subheader("Deploy to Database")
